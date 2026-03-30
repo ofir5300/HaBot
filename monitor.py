@@ -6,6 +6,7 @@ from pathlib import Path
 from checkers import StockResult, get_checker
 from checkers.smarticket import SmartTicketEvent, fetch_events_range, is_relevant_for_toddler
 from checkers.kehilatayim import fetch_events as fetch_kehilatayim_events, is_relevant_for_toddler_kehilatayim
+from checkers.flights import FlightDeparture, fetch_departures
 from config import STATE_FILE
 
 log = logging.getLogger(__name__)
