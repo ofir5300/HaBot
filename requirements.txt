@@ -1,5 +1,5 @@
 requests>=2.31.0
-python-telegram-bot>=21.0
+teleclaude @ git+https://github.com/ofir5300/teleclaude.git@ac68542
 apscheduler>=3.10.0
 python-dotenv>=1.0.0
 beautifulsoup4>=4.12.0
