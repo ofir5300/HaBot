@@ -9,7 +9,7 @@ from telegram.ext import Application
 import checkers
 import monitor
 import telegram_bot
-from config import TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_IDS, CHECK_INTERVAL, STOCK_CHECK_INTERVAL
+from config import TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_IDS, CHECK_INTERVAL, STOCK_CHECK_INTERVAL, FLIGHT_CHECK_INTERVAL
 
 PIDFILE = os.path.join(os.path.dirname(__file__), "habot.pid")
 
@@ -46,6 +46,16 @@ async def poll_kehilatayim(app: Application):
     if new_events:
         log.info("KEHILATAYIM ALERT: %d new events!", len(new_events))
         await telegram_bot.send_smarticket_alert(app, new_events, source="Kehilatayim")
+
+
+async def poll_flights(app: Application):
+    """Check for new TLV departures from Flightradar24."""
+    if not monitor.is_flights_enabled():
+        return
+    new_flights = monitor.check_flights()
+    if new_flights:
+        log.info("FLIGHTS ALERT: %d new departures!", len(new_flights))
+        await telegram_bot.send_flight_alert(app, new_flights)
 
 
 async def daily_summary(app: Application):
@@ -112,6 +122,10 @@ def main():
         id="poll_kehilatayim", max_instances=1,
     )
     scheduler.add_job(
+        poll_flights, "interval", seconds=FLIGHT_CHECK_INTERVAL, args=[app],
+        id="poll_flights", max_instances=1,
+    )
+    scheduler.add_job(
         daily_summary, "cron", hour=19, minute=0, args=[app],
         id="daily_summary",
     )
@@ -134,6 +148,7 @@ def main():
             f"• Stock check: every {STOCK_CHECK_INTERVAL}s\n"
             f"• Smarticket: every {CHECK_INTERVAL}s\n"
             f"• Kehilatayim: every {CHECK_INTERVAL}s\n"
+            f"• Flights (TLV): every {FLIGHT_CHECK_INTERVAL}s\n"
             f"• Daily summary: 19:00",
             parse_mode="Markdown",
         )

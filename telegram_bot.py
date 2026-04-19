@@ -13,6 +13,7 @@ from telegram.ext import (
 import monitor
 from checkers import get_checker, all_checkers, StockResult
 from checkers.smarticket import SmartTicketEvent
+from checkers.flights import FlightDeparture
 from config import TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_IDS
 from url_parser import parse_product_url
 import claude_integration
@@ -26,6 +27,8 @@ COMMANDS = [
     BotCommand("stock_toggle", "Pause or resume monitoring"),
     BotCommand("filter_toggle", "Toggle toddler age filter for events"),
     BotCommand("filters", "Adjust filter settings (age, sources, terms)"),
+    BotCommand("flights", "Flight monitor settings (TLV departures)"),
+    BotCommand("flights_toggle", "Pause/resume flight monitoring"),
     BotCommand("subscribe", "Subscribe to a product URL"),
     BotCommand("unsubscribe", "Remove a monitored item"),
     BotCommand("list", "Show all monitored items"),
@@ -39,6 +42,16 @@ COMMANDS = [
 _claude_busy = False
 _claude_pending_prompt: str | None = None
 _claude_pending_url: str | None = None
+
+_AIRLINE_DISPLAY = {
+    "LY": "El Al", "IZ": "Arkia", "6H": "Israir",
+    "5C": "CAL", "7L": "Silk Way", "U8": "TUS Airways",
+    "W6": "Wizz Air", "FR": "Ryanair", "U2": "EasyJet",
+    "PC": "Pegasus", "5F": "Fly One", "E2": "Eurowings",
+    "3F": "FlyOne Armenia", "BZ": "Blue Bird", "FP": "FlyPop",
+    "WZ": "Red Wings", "HH": "FlyHiSky", "A9": "Georgian Airways",
+    "OE": "Overland Airways", "RD": "Rotana Jet", "HU": "Hainan Airlines",
+}
 
 
 def _esc(text: str) -> str:
@@ -95,27 +108,54 @@ async def send_smarticket_alert(app: Application, events: list[SmartTicketEvent]
     )
 
 
+async def send_flight_alert(app: Application, flights: list[FlightDeparture]):
+    from datetime import datetime
+    lines = ["✈️  *New TLV departure detected!*\n"]
+    for f in flights:
+        dep_str = datetime.fromtimestamp(f.scheduled_ts).strftime("%a %d/%m  %H:%M")
+        lines.append(
+            f"• *{_esc(f.flight_number)} — {_esc(f.airline_name)}*\n"
+            f"  📅 {dep_str}  ✈️  TLV → {_esc(f.destination_city)} ({f.destination_iata})\n"
+            f"  Status: {_esc(f.status)}\n"
+            f"  [FR24]({f.fr24_url}) · [{_esc(f.airline_name)}]({f.airline_url}) · [Book (Kayak)]({f.booking_url()})"
+        )
+    await broadcast(
+        app, "\n\n".join(lines),
+        parse_mode="Markdown", disable_web_page_preview=True,
+    )
+
+
 async def send_daily_summary(app: Application):
     state = monitor.load_state()
-    if not state["items"]:
-        return
 
     lines = ["📋 *Daily Summary*\n"]
-    for item in state["items"]:
-        checker = get_checker(item["source"])
-        if not checker:
-            continue
-        try:
-            result = checker.check(item["item_id"])
-            status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
-            price_str = f" — {result.price} ₪" if result.price else ""
-            name = result.name or item["item_id"]
-            lines.append(f"• *{name}*{price_str}\n  {status}")
-        except Exception as e:
-            lines.append(f"• {item['source']}/{item['item_id']} — ❌ error")
+
+    if state["items"]:
+        for item in state["items"]:
+            checker = get_checker(item["source"])
+            if not checker:
+                continue
+            try:
+                result = checker.check(item["item_id"])
+                status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
+                price_str = f" — {result.price} ₪" if result.price else ""
+                name = result.name or item["item_id"]
+                lines.append(f"• *{name}*{price_str}\n  {status}")
+            except Exception:
+                lines.append(f"• {item['source']}/{item['item_id']} — ❌ error")
 
     paused = state.get("paused", False)
     lines.append(f"\nMonitoring: {'⏸ Paused' if paused else '▶️ Active'}")
+
+    flights_enabled = monitor.is_flights_enabled()
+    flight_settings = monitor.get_flight_filter_settings()
+    airlines = flight_settings.get("airlines", {})
+    airlines_str = ", ".join(k for k, v in airlines.items() if v) if airlines else "All"
+    min_h = flight_settings.get("min_hour", 0)
+    max_h = flight_settings.get("max_hour", 23)
+    lines.append(
+        f"\n✈️  Flights: {'✅' if flights_enabled else '⏸'} {airlines_str} from TLV ({min_h:02d}:00-{max_h:02d}:59)"
+    )
 
     await broadcast(app, "\n".join(lines), parse_mode="Markdown")
 
@@ -151,6 +191,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"• {icon} {src.capitalize()}\n"
     if toddler_on:
         text += f"• 🧒 Toddler filter ON (max age: {settings['max_age']})\n"
+
+    # Flight monitor status
+    flights_enabled = monitor.is_flights_enabled()
+    flight_settings = monitor.get_flight_filter_settings()
+    airlines_on = [k for k, v in flight_settings["airlines"].items() if v]
+    text += "\n✈️  *Flight monitoring (TLV):*\n"
+    icon = "✅" if flights_enabled else "⏸"
+    text += f"• {icon} {'Active' if flights_enabled else 'Paused'}\n"
+    text += f"• Airlines: {', '.join(airlines_on) if airlines_on else 'All'}\n"
+    text += "• Use /flights to configure\n"
 
     # Stock items
     state = monitor.load_state()
@@ -189,7 +239,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stock — Live status (Smarticket + Kehilatayim + stock)\n"
         "/stock\\_toggle — Pause/resume monitoring\n"
         "/filters — Adjust age, sources & include terms\n"
-        "/filter\\_toggle — Quick toggle toddler filter on/off\n\n"
+        "/filter\\_toggle — Quick toggle toddler filter on/off\n"
+        "/flights — Flight monitor settings (TLV departures)\n"
+        "/flights\\_toggle — Pause/resume flight monitoring\n\n"
         "*Subscriptions*\n"
         "/subscribe `<url>` — Monitor a product URL\n"
         "/unsubscribe — Remove a monitored item\n"
@@ -362,6 +414,95 @@ def _build_filters_keyboard() -> tuple[str, InlineKeyboardMarkup]:
         )])
 
     buttons.append([InlineKeyboardButton("✅ Done", callback_data="filter:done")])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def cmd_flights(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = _build_flights_keyboard()
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def cmd_flights_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    enabled = monitor.toggle_flights()
+    status = "✅ Flight monitoring resumed" if enabled else "⏸ Flight monitoring paused"
+    await update.message.reply_text(status)
+
+
+def _build_flights_keyboard() -> tuple[str, InlineKeyboardMarkup]:
+    """Build the /flights settings display and inline keyboard."""
+    from config import FLIGHT_CHECK_INTERVAL
+    enabled = monitor.is_flights_enabled()
+    settings = monitor.get_flight_filter_settings()
+
+    lines = ["✈️  *Flight Monitor (TLV Departures)*\n"]
+    lines.append(f"Status: {'✅ Active' if enabled else '⏸ Paused'}")
+    lines.append(f"Polling: every {FLIGHT_CHECK_INTERVAL}s\n")
+
+    airlines = settings.get("airlines", {})
+    if airlines:
+        lines.append("*Airlines:*")
+        for iata, on in airlines.items():
+            name = _AIRLINE_DISPLAY.get(iata, iata)
+            icon = "✅" if on else "❌"
+            lines.append(f"  {icon} {iata} ({name})")
+    else:
+        lines.append("*Airlines:* All")
+
+    dests = settings.get("destinations", {})
+    if dests:
+        lines.append("\n*Destinations:*")
+        for dest, on in dests.items():
+            icon = "✅" if on else "❌"
+            lines.append(f"  {icon} {dest}")
+    else:
+        lines.append("*Destinations:* All")
+
+    min_h = settings.get("min_hour", 0)
+    max_h = settings.get("max_hour", 23)
+    lines.append(f"*Hours:* {min_h:02d}:00 - {max_h:02d}:59")
+
+    buttons = []
+
+    toggle_label = "⏸ Pause monitoring" if enabled else "▶️  Resume monitoring"
+    buttons.append([InlineKeyboardButton(toggle_label, callback_data="flights:toggle")])
+
+    # Dynamic airline toggles from recently seen flights
+    state = monitor.load_state()
+    seen_iatas = set()
+    for key in state.get("flights", {}).get("known_flight_ids", {}):
+        parts = key.split("_")
+        if parts:
+            seen_iatas.add(parts[0])
+    for iata in airlines:
+        seen_iatas.add(iata)
+
+    if seen_iatas:
+        airline_row = []
+        for iata in sorted(seen_iatas):
+            excluded = airlines.get(iata) is False
+            icon = "❌" if excluded else "✅"
+            airline_row.append(
+                InlineKeyboardButton(f"{icon} {iata}", callback_data=f"flights:airline:{iata}")
+            )
+            if len(airline_row) == 4:
+                buttons.append(airline_row)
+                airline_row = []
+        if airline_row:
+            buttons.append(airline_row)
+
+    # Hour range presets
+    hour_presets = [(1, 6, "01-06"), (6, 12, "06-12"), (12, 18, "12-18"), (22, 6, "22-06"), (0, 23, "All")]
+    hour_row = []
+    for lo, hi, label in hour_presets:
+        active = min_h == lo and max_h == hi
+        prefix = "-> " if active else ""
+        hour_row.append(
+            InlineKeyboardButton(f"{prefix}{label}", callback_data=f"flights:hours:{lo}:{hi}")
+        )
+    buttons.append(hour_row)
+
+    buttons.append([InlineKeyboardButton("✅ Done", callback_data="flights:done")])
 
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -662,12 +803,43 @@ async def _handle_filter_callback(query, data: str):
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
+async def _handle_flights_callback(query, data: str):
+    """Handle /flights inline keyboard callbacks."""
+    if data == "flights:toggle":
+        monitor.toggle_flights()
+    elif data == "flights:done":
+        await query.edit_message_text("✅ Flight settings saved.")
+        return
+    elif data.startswith("flights:airline:"):
+        iata = data.split(":", 2)[2]
+        settings = monitor.get_flight_filter_settings()
+        current = settings["airlines"].get(iata, True)
+        monitor.update_flight_filter_setting(f"airline:{iata}", not current)
+    elif data.startswith("flights:dest:"):
+        dest = data.split(":", 2)[2]
+        settings = monitor.get_flight_filter_settings()
+        current = settings.get("destinations", {}).get(dest, True)
+        monitor.update_flight_filter_setting(f"dest:{dest}", not current)
+    elif data.startswith("flights:hours:"):
+        parts = data.split(":")
+        monitor.update_flight_filter_setting("min_hour", int(parts[2]))
+        monitor.update_flight_filter_setting("max_hour", int(parts[3]))
+
+    text, keyboard = _build_flights_keyboard()
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
 # ── Inline keyboard callback handler ─────────────────────────────────
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    # ── Flight settings callbacks ──
+    if data.startswith("flights:"):
+        await _handle_flights_callback(query, data)
+        return
 
     # ── Filter settings callbacks ──
     if data.startswith("filter:"):
@@ -788,6 +960,8 @@ def setup(app: Application):
     app.add_handler(CommandHandler("stock_toggle", cmd_stock_toggle))
     app.add_handler(CommandHandler("filter_toggle", cmd_filter_toggle))
     app.add_handler(CommandHandler("filters", cmd_filters))
+    app.add_handler(CommandHandler("flights", cmd_flights))
+    app.add_handler(CommandHandler("flights_toggle", cmd_flights_toggle))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("list", cmd_list))

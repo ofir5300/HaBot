@@ -3,3 +3,7 @@ state.json
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
+habot.pid
+logs/
+

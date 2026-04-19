@@ -143,6 +143,161 @@ def is_source_enabled(source: str) -> bool:
     return settings["sources"].get(source, True)
 
 
+# ── Flight filter settings ───────────────────────────────────────────
+
+DEFAULT_FLIGHT_FILTER_SETTINGS: dict = {
+    # Airlines: empty dict = watch ALL. Set specific keys to False to exclude.
+    "airlines": {},
+    # Destinations: empty dict = watch ALL
+    "destinations": {},
+    # Hour-of-day window (supports wrap-around, e.g. min=22 max=6)
+    "min_hour": 1,
+    "max_hour": 6,
+}
+
+
+def get_flight_filter_settings() -> dict:
+    state = load_state()
+    stored = state.get("flights", {}).get("filter_settings", {})
+    merged = {**DEFAULT_FLIGHT_FILTER_SETTINGS, **stored}
+    merged["airlines"] = {
+        **DEFAULT_FLIGHT_FILTER_SETTINGS["airlines"],
+        **stored.get("airlines", {}),
+    }
+    merged["destinations"] = {
+        **DEFAULT_FLIGHT_FILTER_SETTINGS["destinations"],
+        **stored.get("destinations", {}),
+    }
+    return merged
+
+
+def update_flight_filter_setting(key: str, value) -> dict:
+    state = load_state()
+    flights = state.setdefault("flights", {})
+    settings = flights.setdefault("filter_settings", {})
+    if key == "min_hour":
+        settings["min_hour"] = int(value)
+    elif key == "max_hour":
+        settings["max_hour"] = int(value)
+    elif key.startswith("airline:"):
+        iata = key.split(":", 1)[1]
+        settings.setdefault("airlines", {})[iata] = bool(value)
+    elif key.startswith("dest:"):
+        dest_code = key.split(":", 1)[1]
+        settings.setdefault("destinations", {})[dest_code] = bool(value)
+    save_state(state)
+    return get_flight_filter_settings()
+
+
+def is_flights_enabled() -> bool:
+    return load_state().get("flights", {}).get("enabled", True)
+
+
+def toggle_flights() -> bool:
+    state = load_state()
+    flights = state.setdefault("flights", {})
+    flights["enabled"] = not flights.get("enabled", True)
+    save_state(state)
+    return flights["enabled"]
+
+
+_REJECTED_FLIGHT_STATUSES = {"landed", "departed", "canceled", "cancelled", "delayed", "diverted", "unknown"}
+_MIN_LEAD_TIME_SECS = 7200  # 2 hours
+
+
+def _passes_flight_filter(flight: FlightDeparture, settings: dict) -> bool:
+    """Return True if this flight passes current filter settings."""
+    import time as _time
+    from datetime import datetime
+
+    status_lower = (flight.status or "").strip().lower()
+    if any(status_lower.startswith(r) for r in _REJECTED_FLIGHT_STATUSES):
+        return False
+
+    if flight.scheduled_ts - _time.time() < _MIN_LEAD_TIME_SECS:
+        return False
+
+    airlines = settings.get("airlines", {})
+    if airlines and not airlines.get(flight.airline_iata, False):
+        return False
+
+    destinations = settings.get("destinations", {})
+    if destinations and not destinations.get(flight.destination_iata, False):
+        return False
+
+    dep_hour = datetime.fromtimestamp(flight.scheduled_ts).hour
+    min_h = settings.get("min_hour", 0)
+    max_h = settings.get("max_hour", 23)
+    if min_h <= max_h:
+        if not (min_h <= dep_hour <= max_h):
+            return False
+    else:
+        if max_h < dep_hour < min_h:
+            return False
+
+    return True
+
+
+def check_flights() -> list[FlightDeparture]:
+    """Fetch TLV departures from FR24. Return newly-discovered flights matching filters."""
+    import time as _time
+
+    state = load_state()
+    if state.get("paused"):
+        return []
+
+    flights_state = state.setdefault("flights", {})
+    if not flights_state.get("enabled", True):
+        return []
+
+    # known_flight_ids: maps flight_key -> scheduled_ts (for expiry cleanup)
+    known: dict[str, int] = flights_state.setdefault("known_flight_ids", {})
+
+    now_ts = int(_time.time())
+    expired = [k for k, ts in list(known.items()) if ts < now_ts - 3600]
+    for k in expired:
+        del known[k]
+
+    departures = fetch_departures()
+    if not departures:
+        save_state(state)
+        return []
+
+    settings = get_flight_filter_settings()
+
+    # Silent-seed: first run seeds only filter-matching flights (so they
+    # don't alert) but leaves non-matching flights untracked entirely.
+    if not known:
+        seeded = 0
+        for flight in departures:
+            if _passes_flight_filter(flight, settings):
+                known[flight.flight_key] = flight.scheduled_ts
+                seeded += 1
+        log.info("FLIGHTS: first run - seeded %d/%d filter-matching flights silently", seeded, len(departures))
+        save_state(state)
+        return []
+
+    new_flights: list[FlightDeparture] = []
+
+    for flight in departures:
+        if flight.flight_key in known:
+            known[flight.flight_key] = flight.scheduled_ts
+            continue
+
+        if not _passes_flight_filter(flight, settings):
+            continue
+
+        known[flight.flight_key] = flight.scheduled_ts
+        new_flights.append(flight)
+
+    save_state(state)
+
+    if new_flights:
+        log.info("FLIGHTS: %d new TLV departures detected", len(new_flights))
+
+    return new_flights
+
+
 # ── User registration ────────────────────────────────────────────────
 
 def register_user(chat_id: int) -> bool:
@@ -163,11 +318,11 @@ def get_registered_users() -> list[int]:
 
 # ── Smarticket scanner ───────────────────────────────────────────────
 
-SMARTICKET_DAYS_AHEAD = 7
+SMARTICKET_DAYS_AHEAD = 1
 
 
 def check_smarticket() -> list[SmartTicketEvent]:
-    """Scan next 7 days of Smarticket events. Returns newly-discovered available events."""
+    """Scan tomorrow's Smarticket events. Returns newly-discovered available events."""
     state = load_state()
     if state.get("paused"):
         return []
@@ -192,7 +347,7 @@ def check_smarticket() -> list[SmartTicketEvent]:
 
     legacy_ids = set(known_events.pop("_legacy", []))
 
-    # Fetch all events for the next 7 days
+    # Fetch tomorrow's events
     try:
         events = fetch_events_range(SMARTICKET_DAYS_AHEAD)
     except Exception:
@@ -238,7 +393,7 @@ def check_smarticket() -> list[SmartTicketEvent]:
 
 
 def check_kehilatayim() -> list[SmartTicketEvent]:
-    """Scan Kehilatayim events. Returns newly-discovered available events."""
+    """Scan tomorrow's Kehilatayim events. Returns newly-discovered available events."""
     state = load_state()
     if state.get("paused"):
         return []
@@ -258,6 +413,10 @@ def check_kehilatayim() -> list[SmartTicketEvent]:
         log.exception("Error fetching Kehilatayim events")
         save_state(state)
         return []
+
+    # Only keep tomorrow's events
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+    events = [e for e in events if e.date == tomorrow_str]
 
     # Group by date
     events_by_date: dict[str, list[SmartTicketEvent]] = {}
