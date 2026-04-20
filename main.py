@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -11,6 +12,8 @@ from config import (
     ALLOWED_CHAT_IDS, CHECK_INTERVAL, STOCK_CHECK_INTERVAL, FLIGHT_CHECK_INTERVAL,
 )
 from habot_bot import HaBotTelegramBot
+
+PIDFILE = os.path.join(os.path.dirname(__file__), "habot.pid")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,7 +62,7 @@ def daily_summary(bot: HaBotTelegramBot):
 
 
 def main():
-    kill_previous()
+    kill_previous(PIDFILE)
 
     checkers.discover()
 
