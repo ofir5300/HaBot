@@ -1,0 +1,10 @@
+[Unit]
+Description=HaBot git pull + conditional restart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rpi
+WorkingDirectory=/home/rpi/habot
+ExecStart=/home/rpi/habot/deploy/update.sh

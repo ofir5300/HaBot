@@ -1,0 +1,11 @@
+[Unit]
+Description=Run HaBot updater daily
+
+[Timer]
+OnBootSec=2min
+OnCalendar=daily
+Persistent=true
+Unit=habot-update.service
+
+[Install]
+WantedBy=timers.target

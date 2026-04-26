@@ -1,0 +1,16 @@
+[Unit]
+Description=HaBot Telegram availability monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rpi
+WorkingDirectory=/home/rpi/habot
+EnvironmentFile=/home/rpi/habot.env
+ExecStart=/home/rpi/habot/.venv/bin/python -m main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
