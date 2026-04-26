@@ -1,5 +1,5 @@
 requests>=2.31.0
-teleclaude>=0.2.1
+teleclaude>=0.2.2
 apscheduler>=3.10.0
 python-dotenv>=1.0.0
 beautifulsoup4>=4.12.0
