@@ -25,15 +25,34 @@ echo 'yupte100..' | sudo -S apt-get update
 echo 'yupte100..' | sudo -S apt-get install -y git python3-venv
 ```
 
-Clone + venv + deps:
+Python 3.11 via pyenv (Bullseye ships 3.9; `teleclaude` requires ≥3.10):
+```bash
+sudo apt-get install -y make build-essential libssl-dev zlib1g-dev libbz2-dev \
+  libreadline-dev libsqlite3-dev wget curl llvm libncursesw5-dev xz-utils \
+  tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+curl -fsSL https://pyenv.run | bash
+cat >> ~/.bashrc <<'EOF'
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+EOF
+exec $SHELL
+pyenv install 3.11.10           # ~20–30 min compile on Pi
+```
+
+Clone + venv (built from pyenv 3.11) + deps:
 ```bash
 git clone https://github.com/ofir5300/HaBot.git /home/rpi/habot
 cd /home/rpi/habot
-python3 -m venv .venv
+~/.pyenv/versions/3.11.10/bin/python -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
 ```
+
+The `habot.service` ExecStart references `.venv/bin/python` directly, so the
+unit file doesn't need to change — the venv just has to be built from a 3.11
+interpreter.
 
 Env file (chmod 600 — never commit):
 ```bash
