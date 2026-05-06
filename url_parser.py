@@ -8,6 +8,8 @@ import re
 # Each pattern: (compiled regex, source_name, group index for item_id)
 _PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"ksp\.co\.il/web/item/(\d+)"), "ksp"),
+    (re.compile(r"huggies\.co\.il/wipes/([\w\-]+)"), "huggies"),
+    (re.compile(r"ucare\.co\.il/baby/diapers/([\w\-]+)"), "ucare"),
 ]
 
 
