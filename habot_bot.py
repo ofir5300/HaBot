@@ -300,35 +300,20 @@ class HaBotTelegramBot(TeleClaudeBot):
     def domain_commands(self):
         return {
             "/start": (self._cmd_start, "Welcome message"),
-            "/stock": (self._cmd_stock, "Live stock & events status"),
-            "/stock_toggle": (self._cmd_stock_toggle, "Pause/resume stock monitoring"),
-            "/filters": (self._cmd_filters, "Event filter settings"),
-            "/filter_toggle": (self._cmd_filter_toggle, "Toggle toddler age filter"),
-            "/flights": (self._cmd_flights, "Flight monitor settings"),
-            "/flights_toggle": (self._cmd_flights_toggle, "Pause/resume flight monitoring"),
-            "/subscribe": (self._cmd_subscribe, "Subscribe to a product URL"),
-            "/unsubscribe": (self._cmd_unsubscribe, "Remove a monitored item"),
-            "/list": (self._cmd_list, "Show all monitored items"),
+            "/events": (self._cmd_events, "Events hub (Smarticket + Kehilatayim)"),
+            "/flights": (self._cmd_flights, "Flights hub (TLV departures)"),
+            "/stock": (self._cmd_stock, "Stock hub (monitored products)"),
         }
 
     def help_text(self) -> str:
         return (
-            "<b>🤖 HaBot Commands</b>\n\n"
-            "<b>Events &amp; Stock</b>\n"
-            "/stock — Live status (Smarticket + Kehilatayim + stock)\n"
-            "/stock_toggle — Pause/resume monitoring\n"
-            "/filters — Adjust age, sources &amp; include terms\n"
-            "/filter_toggle — Quick toggle toddler filter on/off\n"
-            "/flights — Flight monitor settings (TLV departures)\n"
-            "/flights_toggle — Pause/resume flight monitoring\n\n"
-            "<b>Subscriptions</b>\n"
-            "/subscribe &lt;url&gt; — Monitor a product URL\n"
-            "/unsubscribe — Remove a monitored item\n"
-            "/list — Show all items with actions\n\n"
-            "<b>Claude Code</b>\n"
-            "/claude — Claude Code menu (ask, plan, approve/reject)\n"
-            "/restart — Restart the bot\n\n"
-            "Send any free text to chat with Claude; paste a URL to subscribe."
+            "<b>🤖 HaBot</b>\n\n"
+            "/events — Smarticket + Kehilatayim (filters, pause, toddler toggle)\n"
+            "/flights — TLV departures (filters, pause)\n"
+            "/stock — Monitored products (check, remove, pause)\n\n"
+            "Paste a product URL in chat to subscribe.\n"
+            "Send free text or voice to chat with Claude.\n\n"
+            "/claude · /restart · /help"
         )
 
     def on_domain_callback(self, data: str, message_id: int) -> bool:
@@ -336,6 +321,10 @@ class HaBotTelegramBot(TeleClaudeBot):
             return self._handle_flights_callback(data, message_id)
         if data.startswith("filter:"):
             return self._handle_filter_callback(data, message_id)
+        if data.startswith("events:"):
+            return self._handle_events_callback(data, message_id)
+        if data.startswith("stock:"):
+            return self._handle_stock_callback(data, message_id)
         if data == "unsub:cancel":
             self.edit_message(message_id, "Cancelled.")
             return True
@@ -422,186 +411,24 @@ class HaBotTelegramBot(TeleClaudeBot):
             "• Stock checked every 5 minutes\n"
             "• Alerts on new available events & stock transitions\n"
             "• Daily summary at 19:00\n\n"
-            "Use /filters to adjust age & source settings.\n"
+            "Use /events to manage event filters.\n"
             "Use /help to see all commands."
         )
         if is_new and chat_id_int is not None:
             text += f"\n\n✅ Registered for notifications (chat ID: `{chat_id_int}`)"
         self.send_md(text)
 
-    def _cmd_stock(self):
-        state = monitor.load_state()
-        if not state["items"]:
-            self.send_md("No items being monitored. 🤷")
-            return
-
-        paused = state.get("paused", False)
-        lines = [f"📊 *Stock Status* {'⏸ PAUSED' if paused else '▶️ Active'}\n"]
-        for item in state["items"]:
-            checker = get_checker(item["source"])
-            if not checker:
-                lines.append(f"• {item['source']}/{item['item_id']} — ⚠️ no checker")
-                continue
-            try:
-                result = checker.check(item["item_id"])
-                status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
-                price_str = f" — {result.price} ₪" if result.price else ""
-                name = result.name or item["item_id"]
-                lines.append(f"• *{_esc_md(name)}*{price_str}\n  {status} ({item['source'].upper()})")
-            except Exception:
-                lines.append(f"• {item['source']}/{item['item_id']} — ❌ error")
-
-        self.send_md("\n".join(lines))
-
-        from checkers.smarticket import fetch_events_range, is_relevant_for_toddler
-        from checkers.kehilatayim import fetch_events as fetch_kehilatayim_events
-        from datetime import date as _date
-
-        toddler_on = monitor.is_toddler_filter_on()
-
-        def _send_events_section(source_name: str, raw_events: list, filter_fn):
-            all_events = [e for e in raw_events if filter_fn(e)] if toddler_on else raw_events
-            by_date: dict[str, list] = {}
-            for e in all_events:
-                by_date.setdefault(e.date, []).append(e)
-
-            if not all_events:
-                self.send_md(f"🎟 *{source_name}*\nNo events found")
-                return
-
-            msg_lines = [f"🎟 *{source_name}*"]
-            for event_date in sorted(by_date.keys()):
-                try:
-                    d = _date.fromisoformat(event_date)
-                    day_label = d.strftime("%a %d/%m")
-                except ValueError:
-                    day_label = event_date
-                day_events = by_date[event_date]
-                available = [e for e in day_events if e.available]
-                sold_out_count = len(day_events) - len(available)
-
-                day_lines = [f"\n*{day_label}* ({len(available)} available, {sold_out_count} sold out)"]
-                for e in available:
-                    day_lines.append(f"• 🟢 {e.time} — *{_esc_md(e.name)}*")
-                if not available:
-                    day_lines.append("  All sold out")
-
-                candidate = "\n".join(msg_lines + day_lines)
-                if len(candidate) > 3800 and len(msg_lines) > 1:
-                    self.send_md("\n".join(msg_lines))
-                    msg_lines = [f"🎟 *{source_name} (cont.)*"]
-                msg_lines.extend(day_lines)
-
-            if msg_lines:
-                self.send_md("\n".join(msg_lines))
-
-        if monitor.is_source_enabled("smarticket"):
-            try:
-                smarticket_events = fetch_events_range()
-                _send_events_section(
-                    "Smarticket — next 7 days", smarticket_events,
-                    lambda e: is_relevant_for_toddler(e.name),
-                )
-            except Exception:
-                self.send_md("🎟 ❌ Error fetching Smarticket events")
-
-        if monitor.is_source_enabled("kehilatayim"):
-            try:
-                kehilatayim_events = fetch_kehilatayim_events()
-                _send_events_section(
-                    "Kehilatayim (Givatayim)", kehilatayim_events,
-                    lambda e: is_relevant_for_toddler(e.name),
-                )
-            except Exception:
-                self.send_md("🎟 ❌ Error fetching Kehilatayim events")
-
-    def _cmd_stock_toggle(self):
-        paused = monitor.toggle_pause()
-        self.send("⏸ Monitoring paused" if paused else "▶️ Monitoring resumed")
-
-    def _cmd_filter_toggle(self):
-        enabled = monitor.toggle_toddler_filter()
-        if enabled:
-            self.send("🧒 Toddler filter ON — showing only events for ages ~1.5–3")
-        else:
-            self.send("🔓 Toddler filter OFF — showing all events")
-
-    def _cmd_filters(self):
-        text, keyboard = self._build_filters_view()
+    def _cmd_events(self):
+        text, keyboard = self._build_events_view()
         self.send_md(text, reply_markup=keyboard)
 
     def _cmd_flights(self):
         text, keyboard = self._build_flights_view()
         self.send_md(text, reply_markup=keyboard)
 
-    def _cmd_flights_toggle(self):
-        enabled = monitor.toggle_flights()
-        self.send("✅ Flight monitoring resumed" if enabled else "⏸ Flight monitoring paused")
-
-    def _cmd_subscribe(self):
-        parts = self._last_message_text.split(maxsplit=1)
-        if len(parts) < 2:
-            self.send_md(
-                "Usage: /subscribe `<url>`\n"
-                "Example: /subscribe https://ksp.co.il/web/item/12345"
-            )
-            return
-        self._subscribe_url(parts[1].strip())
-
-    def _cmd_unsubscribe(self):
-        items = monitor.get_items()
-        if not items:
-            self.send("No items to unsubscribe from. 🤷")
-            return
-
-        buttons = []
-        for item in items:
-            label = f"{item['source'].upper()}: {item['item_id']}"
-            checker = get_checker(item["source"])
-            if checker:
-                try:
-                    result = checker.check(item["item_id"])
-                    if result.name:
-                        label = f"{result.name} ({item['source'].upper()})"
-                except Exception:
-                    pass
-            callback = f"unsub:{item['source']}:{item['item_id']}"
-            buttons.append([{"text": f"🗑 {label}", "callback_data": callback}])
-        buttons.append([{"text": "❌ Cancel", "callback_data": "unsub:cancel"}])
-
-        self.send_with_markup("Select an item to unsubscribe:", {"inline_keyboard": buttons})
-
-    def _cmd_list(self):
-        items = monitor.get_items()
-        if not items:
-            self.send("No items being monitored. Use /subscribe to add one.")
-            return
-
-        lines = ["📊 *Monitored Items*\n"]
-        buttons = []
-        for item in items:
-            checker = get_checker(item["source"])
-            name = item["item_id"]
-            status_line = ""
-            if checker:
-                try:
-                    result = checker.check(item["item_id"])
-                    name = result.name or item["item_id"]
-                    status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
-                    price_str = f" — {result.price} ₪" if result.price else ""
-                    status_line = f"\n  {status}{price_str} ({item['source'].upper()})"
-                except Exception:
-                    status_line = f"\n  ⚠️ Check failed ({item['source'].upper()})"
-            else:
-                status_line = f"\n  ⚠️ No checker ({item['source'].upper()})"
-            lines.append(f"• *{_esc_md(name)}*{status_line}")
-
-            buttons.append([
-                {"text": "🔍 Check", "callback_data": f"check:{item['source']}:{item['item_id']}"},
-                {"text": "🗑 Remove", "callback_data": f"unsub:{item['source']}:{item['item_id']}"},
-            ])
-
-        self.send_md("\n".join(lines), reply_markup={"inline_keyboard": buttons})
+    def _cmd_stock(self):
+        text, keyboard = self._build_stock_view()
+        self.send_md(text, reply_markup=keyboard)
 
     # -- Subscribe flow (known URL direct; unknown → Claude plan) ----------
 
@@ -630,7 +457,7 @@ class HaBotTelegramBot(TeleClaudeBot):
             else:
                 self.send_md(
                     f"Already monitoring *{_esc_md(name)}* ({source.upper()}){status_line}\n\n"
-                    f"Use /list to manage your subscriptions."
+                    f"Use /stock to manage your subscriptions."
                 )
             return
 
@@ -725,6 +552,150 @@ class HaBotTelegramBot(TeleClaudeBot):
         return "\n".join(lines)
 
     # -- Inline keyboard views ---------------------------------------------
+
+    def _build_events_view(self) -> tuple[str, dict]:
+        from checkers.smarticket import fetch_events_range, is_relevant_for_toddler
+        from checkers.kehilatayim import fetch_events as fetch_kehilatayim_events
+        from datetime import date as _date
+
+        paused = monitor.is_events_paused()
+        toddler_on = monitor.is_toddler_filter_on()
+        settings = monitor.get_filter_settings()
+        sources_on = [s.capitalize() for s, en in settings["sources"].items() if en]
+
+        lines = [f"🎟 *Events* {'⏸ PAUSED' if paused else '▶️ Active'}\n"]
+        toddler_label = f"🧒 Toddler filter: *{'ON' if toddler_on else 'OFF'}*"
+        if toddler_on:
+            toddler_label += f" (max age {settings['max_age']})"
+        lines.append(toddler_label)
+        lines.append(f"📡 Sources: {', '.join(sources_on) if sources_on else 'None'}\n")
+
+        def _format_section(source_name: str, raw_events: list, filter_fn) -> list[str]:
+            evts = [e for e in raw_events if filter_fn(e)] if toddler_on else raw_events
+            section = [f"*{source_name}*"]
+            if not evts:
+                section.append("  No events found")
+                return section
+            by_date: dict[str, list] = {}
+            for e in evts:
+                by_date.setdefault(e.date, []).append(e)
+            for event_date in sorted(by_date.keys()):
+                try:
+                    d = _date.fromisoformat(event_date)
+                    day_label = d.strftime("%a %d/%m")
+                except ValueError:
+                    day_label = event_date
+                day_events = by_date[event_date]
+                available = [e for e in day_events if e.available]
+                sold_out = len(day_events) - len(available)
+                section.append(f"\n_{day_label}_ ({len(available)} available, {sold_out} sold out)")
+                for e in available:
+                    section.append(f"• 🟢 {e.time} — {_esc_md(e.name)}")
+                if not available:
+                    section.append("  All sold out")
+            return section
+
+        if not paused:
+            if monitor.is_source_enabled("smarticket"):
+                lines.append("")
+                try:
+                    lines.extend(_format_section(
+                        "Smarticket — next 7 days", fetch_events_range(),
+                        lambda e: is_relevant_for_toddler(e.name),
+                    ))
+                except Exception:
+                    lines.append("*Smarticket*\n  ❌ Error fetching events")
+            if monitor.is_source_enabled("kehilatayim"):
+                lines.append("")
+                try:
+                    lines.extend(_format_section(
+                        "Kehilatayim (Givatayim)", fetch_kehilatayim_events(),
+                        lambda e: is_relevant_for_toddler(e.name),
+                    ))
+                except Exception:
+                    lines.append("*Kehilatayim*\n  ❌ Error fetching events")
+
+        # Truncate to safe Telegram size
+        text = "\n".join(lines)
+        if len(text) > 3800:
+            text = text[:3800] + "\n…"
+
+        buttons = [
+            [
+                {"text": "▶️ Resume" if paused else "⏸ Pause",
+                 "callback_data": "events:toggle"},
+                {"text": f"🧒 Toddler: {'ON' if toddler_on else 'OFF'}",
+                 "callback_data": "events:toddler"},
+            ],
+            [{"text": "⚙️ Filters", "callback_data": "events:filters"}],
+            [{"text": "🔄 Refresh", "callback_data": "events:refresh"}],
+        ]
+        return text, {"inline_keyboard": buttons}
+
+    def _build_stock_view(self) -> tuple[str, dict]:
+        items = monitor.get_items()
+        paused = monitor.is_paused()
+        header = f"📊 *Stock* {'⏸ PAUSED' if paused else '▶️ Active'}"
+
+        if not items:
+            text = (f"{header}\n\nNo items being monitored.\n"
+                    "Paste a product URL in chat to add one.")
+            buttons = [[{"text": "▶️ Resume" if paused else "⏸ Pause",
+                         "callback_data": "stock:toggle"}]]
+            return text, {"inline_keyboard": buttons}
+
+        lines = [header, ""]
+        buttons = [[{"text": "▶️ Resume" if paused else "⏸ Pause",
+                     "callback_data": "stock:toggle"},
+                    {"text": "🔄 Refresh", "callback_data": "stock:refresh"}]]
+        for item in items:
+            checker = get_checker(item["source"])
+            name = item["item_id"]
+            status_line = ""
+            if checker:
+                try:
+                    result = checker.check(item["item_id"])
+                    name = result.name or item["item_id"]
+                    status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
+                    price_str = f" — {result.price} ₪" if result.price else ""
+                    status_line = f"\n  {status}{price_str} ({item['source'].upper()})"
+                except Exception:
+                    status_line = f"\n  ⚠️ Check failed ({item['source'].upper()})"
+            else:
+                status_line = f"\n  ⚠️ No checker ({item['source'].upper()})"
+            lines.append(f"• *{_esc_md(name)}*{status_line}")
+            buttons.append([
+                {"text": "🔍 Check", "callback_data": f"check:{item['source']}:{item['item_id']}"},
+                {"text": "🗑 Remove", "callback_data": f"unsub:{item['source']}:{item['item_id']}"},
+            ])
+
+        return "\n".join(lines), {"inline_keyboard": buttons}
+
+    def _handle_events_callback(self, data: str, message_id: int) -> bool:
+        if data == "events:toggle":
+            monitor.toggle_events_pause()
+        elif data == "events:toddler":
+            monitor.toggle_toddler_filter()
+        elif data == "events:filters":
+            text, keyboard = self._build_filters_view()
+            self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
+            return True
+        elif data == "events:refresh":
+            pass
+
+        text, keyboard = self._build_events_view()
+        self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
+        return True
+
+    def _handle_stock_callback(self, data: str, message_id: int) -> bool:
+        if data == "stock:toggle":
+            monitor.toggle_pause()
+        elif data == "stock:refresh":
+            pass
+
+        text, keyboard = self._build_stock_view()
+        self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
+        return True
 
     def _build_filters_view(self) -> tuple[str, dict]:
         settings = monitor.get_filter_settings()
@@ -837,7 +808,8 @@ class HaBotTelegramBot(TeleClaudeBot):
         if data == "filter:toggle":
             monitor.toggle_toddler_filter()
         elif data == "filter:done":
-            self.edit_message(message_id, "✅ Filter settings saved.")
+            text, keyboard = self._build_events_view()
+            self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
             return True
         elif data.startswith("filter:age:"):
             age = data.split(":", 2)[2]

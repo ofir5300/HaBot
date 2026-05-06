@@ -88,6 +88,17 @@ def is_paused() -> bool:
     return load_state().get("paused", False)
 
 
+def toggle_events_pause() -> bool:
+    state = load_state()
+    state["events_paused"] = not state.get("events_paused", False)
+    save_state(state)
+    return state["events_paused"]
+
+
+def is_events_paused() -> bool:
+    return load_state().get("events_paused", False)
+
+
 def toggle_toddler_filter() -> bool:
     state = load_state()
     state["toddler_filter"] = not state.get("toddler_filter", True)
@@ -324,7 +335,7 @@ SMARTICKET_DAYS_AHEAD = 1
 def check_smarticket() -> list[SmartTicketEvent]:
     """Scan tomorrow's Smarticket events. Returns newly-discovered available events."""
     state = load_state()
-    if state.get("paused"):
+    if state.get("paused") or state.get("events_paused"):
         return []
 
     st = state.setdefault("smarticket", {"known_events": {}})
@@ -395,7 +406,7 @@ def check_smarticket() -> list[SmartTicketEvent]:
 def check_kehilatayim() -> list[SmartTicketEvent]:
     """Scan tomorrow's Kehilatayim events. Returns newly-discovered available events."""
     state = load_state()
-    if state.get("paused"):
+    if state.get("paused") or state.get("events_paused"):
         return []
 
     kt = state.setdefault("kehilatayim", {"known_events": {}})
