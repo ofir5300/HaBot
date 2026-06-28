@@ -65,6 +65,8 @@ class HaBotTelegramBot(TeleClaudeBot):
         self._current_chat_id: Optional[str] = None
         self._pending_checker_prompt: Optional[str] = None
         self._pending_checker_url: Optional[str] = None
+        # Set by main.py: callback(mode: str) that reschedules polling jobs.
+        self.on_frequency_change = None
 
     # -- Auth + per-request chat_id override -------------------------------
 
@@ -261,9 +263,23 @@ class HaBotTelegramBot(TeleClaudeBot):
             )
         self.broadcast_md("\n\n".join(lines))
 
-    def send_daily_summary(self):
+    def send_failure_alert(self, notif: dict):
+        """Broadcast a failed-check (or recovery) notification."""
+        key = notif.get("key", "?")
+        count = notif.get("count", 0)
+        if notif.get("type") == "recovered":
+            text = f"✅ *Check recovered*\n\n`{_esc_md(key)}` is responding again."
+        else:
+            text = (
+                f"⚠️ *Repeated check failures*\n\n"
+                f"`{_esc_md(key)}` has failed *{count}* times in a row.\n"
+                f"Its checker may be broken or the source may be down."
+            )
+        self.broadcast_md(text)
+
+    def send_weekly_summary(self):
         state = monitor.load_state()
-        lines = ["📋 *Daily Summary*\n"]
+        lines = ["📋 *Weekly Summary*\n"]
         if state["items"]:
             for item in state["items"]:
                 checker = get_checker(item["source"])
@@ -303,6 +319,7 @@ class HaBotTelegramBot(TeleClaudeBot):
             "/events": (self._cmd_events, "Events hub (Smarticket + Kehilatayim)"),
             "/flights": (self._cmd_flights, "Flights hub (TLV departures)"),
             "/stock": (self._cmd_stock, "Stock hub (monitored products)"),
+            "/frequency": (self._cmd_frequency, "How often to check (minutes/hourly/daily)"),
         }
 
     def help_text(self) -> str:
@@ -310,7 +327,8 @@ class HaBotTelegramBot(TeleClaudeBot):
             "<b>🤖 HaBot</b>\n\n"
             "/events — Smarticket + Kehilatayim (filters, pause, toddler toggle)\n"
             "/flights — TLV departures (filters, pause)\n"
-            "/stock — Monitored products (check, remove, pause)\n\n"
+            "/stock — Monitored products (check, remove, pause)\n"
+            "/frequency — How often I check (few minutes / hourly / daily)\n\n"
             "Paste a product URL in chat to subscribe.\n"
             "Send free text or voice to chat with Claude.\n\n"
             "/claude · /restart · /help"
@@ -325,6 +343,8 @@ class HaBotTelegramBot(TeleClaudeBot):
             return self._handle_events_callback(data, message_id)
         if data.startswith("stock:"):
             return self._handle_stock_callback(data, message_id)
+        if data.startswith("freq:"):
+            return self._handle_frequency_callback(data, message_id)
         if data == "unsub:cancel":
             self.edit_message(message_id, "Cancelled.")
             return True
@@ -337,6 +357,21 @@ class HaBotTelegramBot(TeleClaudeBot):
                 )
             else:
                 self.edit_message(message_id, "Item not found.")
+            return True
+        if data.startswith("toggle:"):
+            _, source, item_id = data.split(":", 2)
+            items = monitor.get_items()
+            current = next(
+                (i for i in items if i["source"] == source and i["item_id"] == item_id),
+                None,
+            )
+            if not current:
+                self.edit_message(message_id, "Item not found.")
+                return True
+            new_enabled = not current.get("enabled", True)
+            monitor.set_item_enabled(source, item_id, new_enabled)
+            text, keyboard = self._build_stock_view()
+            self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
             return True
         if data.startswith("check:"):
             _, source, item_id = data.split(":", 2)
@@ -405,12 +440,13 @@ class HaBotTelegramBot(TeleClaudeBot):
         else:
             text += "• No items yet\n"
 
+        freq_label = monitor.FREQUENCY_PRESETS[monitor.get_check_frequency()]["label"]
         text += (
             "\n🔔 *How it works:*\n"
-            "• Events checked every 5 minutes (Smarticket + Kehilatayim)\n"
-            "• Stock checked every 5 minutes\n"
+            f"• Check frequency: *{freq_label}* (change with /frequency)\n"
             "• Alerts on new available events & stock transitions\n"
-            "• Daily summary at 19:00\n\n"
+            "• Heads-up if a checker keeps failing\n"
+            "• Weekly summary on Sundays at 19:00\n\n"
             "Use /events to manage event filters.\n"
             "Use /help to see all commands."
         )
@@ -429,6 +465,39 @@ class HaBotTelegramBot(TeleClaudeBot):
     def _cmd_stock(self):
         text, keyboard = self._build_stock_view()
         self.send_md(text, reply_markup=keyboard)
+
+    def _cmd_frequency(self):
+        text, keyboard = self._build_frequency_view()
+        self.send_md(text, reply_markup=keyboard)
+
+    def _build_frequency_view(self) -> tuple[str, dict]:
+        current = monitor.get_check_frequency()
+        presets = monitor.FREQUENCY_PRESETS
+        lines = ["⏱ *Check Frequency*\n"]
+        lines.append("How often I check stock, events and flights.\n")
+        for mode, cfg in presets.items():
+            mark = "✅ " if mode == current else "▫️ "
+            lines.append(f"{mark}*{cfg['label']}*")
+        lines.append("\n_Less frequent checks = fewer, later alerts._")
+
+        buttons = []
+        for mode, cfg in presets.items():
+            label = ("✅ " if mode == current else "") + cfg["label"]
+            buttons.append([{"text": label, "callback_data": f"freq:{mode}"}])
+        return "\n".join(lines), {"inline_keyboard": buttons}
+
+    def _handle_frequency_callback(self, data: str, message_id: int) -> bool:
+        mode = data.split(":", 1)[1]
+        if mode in monitor.FREQUENCY_PRESETS:
+            monitor.set_check_frequency(mode)
+            if callable(self.on_frequency_change):
+                try:
+                    self.on_frequency_change(mode)
+                except Exception:
+                    log.exception("Failed to apply frequency change")
+        text, keyboard = self._build_frequency_view()
+        self.edit_message(message_id, text, reply_markup=keyboard, parse_mode="Markdown")
+        return True
 
     # -- Subscribe flow (known URL direct; unknown → Claude plan) ----------
 
@@ -651,6 +720,8 @@ class HaBotTelegramBot(TeleClaudeBot):
         for item in items:
             checker = get_checker(item["source"])
             name = item["item_id"]
+            enabled = item.get("enabled", True)
+            disabled_tag = "" if enabled else " ⏸ paused"
             status_line = ""
             if checker:
                 try:
@@ -658,14 +729,16 @@ class HaBotTelegramBot(TeleClaudeBot):
                     name = result.name or item["item_id"]
                     status = "🟢 In stock" if result.in_stock else "🔴 Out of stock"
                     price_str = f" — {result.price} ₪" if result.price else ""
-                    status_line = f"\n  {status}{price_str} ({item['source'].upper()})"
+                    status_line = f"\n  {status}{price_str} ({item['source'].upper()}){disabled_tag}"
                 except Exception:
-                    status_line = f"\n  ⚠️ Check failed ({item['source'].upper()})"
+                    status_line = f"\n  ⚠️ Check failed ({item['source'].upper()}){disabled_tag}"
             else:
-                status_line = f"\n  ⚠️ No checker ({item['source'].upper()})"
+                status_line = f"\n  ⚠️ No checker ({item['source'].upper()}){disabled_tag}"
             lines.append(f"• *{_esc_md(name)}*{status_line}")
+            toggle_label = "⏸ Pause" if enabled else "▶️ Resume"
             buttons.append([
                 {"text": "🔍 Check", "callback_data": f"check:{item['source']}:{item['item_id']}"},
+                {"text": toggle_label, "callback_data": f"toggle:{item['source']}:{item['item_id']}"},
                 {"text": "🗑 Remove", "callback_data": f"unsub:{item['source']}:{item['item_id']}"},
             ])
 
@@ -737,13 +810,13 @@ class HaBotTelegramBot(TeleClaudeBot):
         return "\n".join(lines), {"inline_keyboard": buttons}
 
     def _build_flights_view(self) -> tuple[str, dict]:
-        from config import FLIGHT_CHECK_INTERVAL
         enabled = monitor.is_flights_enabled()
         settings = monitor.get_flight_filter_settings()
+        freq_label = monitor.FREQUENCY_PRESETS[monitor.get_check_frequency()]["label"]
 
         lines = ["✈️  *Flight Monitor (TLV Departures)*\n"]
         lines.append(f"Status: {'✅ Active' if enabled else '⏸ Paused'}")
-        lines.append(f"Polling: every {FLIGHT_CHECK_INTERVAL}s\n")
+        lines.append(f"Polling: {freq_label.lower()} (/frequency)\n")
 
         airlines = settings.get("airlines", {})
         if airlines:

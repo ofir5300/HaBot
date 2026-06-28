@@ -52,6 +52,17 @@ def get_items() -> list[dict]:
     return load_state()["items"]
 
 
+def set_item_enabled(source: str, item_id: str, enabled: bool) -> bool:
+    """Enable/disable polling for an item without removing it. Returns True if found."""
+    state = load_state()
+    for item in state["items"]:
+        if item["source"] == source and item["item_id"] == item_id:
+            item["enabled"] = enabled
+            save_state(state)
+            return True
+    return False
+
+
 def check_all() -> list[tuple[dict, StockResult]]:
     """Check all items. Returns list of (item, result) for items that transitioned to in-stock."""
     state = load_state()
@@ -60,21 +71,91 @@ def check_all() -> list[tuple[dict, StockResult]]:
 
     alerts = []
     for item in state["items"]:
+        if not item.get("enabled", True):
+            continue
         checker = get_checker(item["source"])
         if not checker:
             log.warning("No checker for source: %s", item["source"])
             continue
+        key = f"{item['source']}/{item['item_id']}"
         try:
             result = checker.check(item["item_id"])
             was_in_stock = item.get("last_in_stock", False)
             if result.in_stock and not was_in_stock:
                 alerts.append((item, result))
             item["last_in_stock"] = result.in_stock
+            record_check_result(state, key, True)
         except Exception:
             log.exception("Error checking %s/%s", item["source"], item["item_id"])
+            record_check_result(state, key, False)
 
     save_state(state)
     return alerts
+
+
+# ── Check frequency ──────────────────────────────────────────────────
+
+FREQUENCY_PRESETS: dict[str, dict] = {
+    "minutes": {"label": "Every few minutes", "stock": 300, "events": 300, "flights": 60},
+    "hourly": {"label": "Every hour", "stock": 3600, "events": 3600, "flights": 3600},
+    "daily": {"label": "Once a day", "stock": 86400, "events": 86400, "flights": 86400},
+}
+DEFAULT_FREQUENCY = "minutes"
+
+
+def get_check_frequency() -> str:
+    mode = load_state().get("check_frequency", DEFAULT_FREQUENCY)
+    return mode if mode in FREQUENCY_PRESETS else DEFAULT_FREQUENCY
+
+
+def set_check_frequency(mode: str) -> str:
+    if mode not in FREQUENCY_PRESETS:
+        raise ValueError(f"Unknown frequency mode: {mode}")
+    state = load_state()
+    state["check_frequency"] = mode
+    save_state(state)
+    return mode
+
+
+def frequency_intervals(mode: str | None = None) -> dict:
+    """Return {stock, events, flights} interval seconds for the active (or given) mode."""
+    return FREQUENCY_PRESETS[mode or get_check_frequency()]
+
+
+# ── Failed-check notifier ────────────────────────────────────────────
+
+FAILURE_THRESHOLD = 3  # alert after MORE than this many consecutive failures
+
+
+def record_check_result(state: dict, key: str, ok: bool):
+    """Track consecutive check failures (mutates `state` in place).
+
+    Queues a one-shot notification onto state["failure_notifications"] when a
+    source crosses the threshold (>3 consecutive failures) and again once it
+    recovers. Persisted by the caller's save_state(state)."""
+    failures = state.setdefault("check_failures", {})
+    entry = failures.setdefault(key, {"count": 0, "alerted": False})
+    queue = state.setdefault("failure_notifications", [])
+    if ok:
+        if entry.get("alerted"):
+            queue.append({"key": key, "type": "recovered", "count": entry.get("count", 0)})
+        entry["count"] = 0
+        entry["alerted"] = False
+    else:
+        entry["count"] = entry.get("count", 0) + 1
+        if entry["count"] > FAILURE_THRESHOLD and not entry.get("alerted"):
+            entry["alerted"] = True
+            queue.append({"key": key, "type": "failing", "count": entry["count"]})
+
+
+def pop_failure_notifications() -> list[dict]:
+    """Drain and return queued failure/recovery notifications."""
+    state = load_state()
+    queue = state.get("failure_notifications", [])
+    if queue:
+        state["failure_notifications"] = []
+        save_state(state)
+    return queue
 
 
 def toggle_pause() -> bool:
@@ -269,7 +350,15 @@ def check_flights() -> list[FlightDeparture]:
     for k in expired:
         del known[k]
 
-    departures = fetch_departures()
+    try:
+        departures = fetch_departures()
+        record_check_result(state, "flights", True)
+    except Exception:
+        log.exception("Error fetching TLV departures")
+        record_check_result(state, "flights", False)
+        save_state(state)
+        return []
+
     if not departures:
         save_state(state)
         return []
@@ -361,8 +450,10 @@ def check_smarticket() -> list[SmartTicketEvent]:
     # Fetch tomorrow's events
     try:
         events = fetch_events_range(SMARTICKET_DAYS_AHEAD)
+        record_check_result(state, "smarticket", True)
     except Exception:
         log.exception("Error fetching Smarticket events")
+        record_check_result(state, "smarticket", False)
         save_state(state)
         return []
 
@@ -420,8 +511,10 @@ def check_kehilatayim() -> list[SmartTicketEvent]:
 
     try:
         events = fetch_kehilatayim_events()
+        record_check_result(state, "kehilatayim", True)
     except Exception:
         log.exception("Error fetching Kehilatayim events")
+        record_check_result(state, "kehilatayim", False)
         save_state(state)
         return []
 
