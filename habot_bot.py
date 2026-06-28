@@ -309,6 +309,10 @@ class HaBotTelegramBot(TeleClaudeBot):
         self.broadcast_md("\n".join(lines))
 
     def broadcast_startup(self, text: str):
+        # Throttle: if the process restart-loops, don't spam every respawn.
+        if not monitor.should_broadcast_startup():
+            log.info("Skipping startup broadcast (throttled <5min since last)")
+            return
         self.broadcast_md(text)
 
     # -- TeleClaudeBot hooks -----------------------------------------------

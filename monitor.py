@@ -148,6 +148,22 @@ def record_check_result(state: dict, key: str, ok: bool):
             queue.append({"key": key, "type": "failing", "count": entry["count"]})
 
 
+def should_broadcast_startup(min_interval_secs: int = 300) -> bool:
+    """Rate-limit startup broadcasts so a launchd respawn loop can't spam subscribers.
+
+    Returns True (and records the timestamp) only if the last startup broadcast was
+    more than min_interval_secs ago; otherwise False."""
+    import time
+    state = load_state()
+    now = time.time()
+    last = state.get("last_startup_broadcast_ts", 0)
+    if now - last < min_interval_secs:
+        return False
+    state["last_startup_broadcast_ts"] = now
+    save_state(state)
+    return True
+
+
 def pop_failure_notifications() -> list[dict]:
     """Drain and return queued failure/recovery notifications."""
     state = load_state()
